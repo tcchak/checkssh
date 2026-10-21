@@ -1,0 +1,400 @@
+#!/usr/bin/env bash
+#==============================================================================
+# compare-inventory.sh
+# VERSION: 1.0.0
+#------------------------------------------------------------------------------
+# TARGET ENVIRONMENT
+#   - Primary: RHEL 8.10 (bash 4.x)
+#   - Also compatible with macOS bash 3.2
+#
+# USAGE
+#   ./compare-inventory.sh [finalized-inventory] [inventory.ini]
+#
+# PROMPTS
+#   1) Finalized inventory path  (default: finalized-inventory)
+#   2) Inventory.ini path        (default: inventory.ini)
+#   3) Confirm removal of extras (y/N) after differences are shown
+#
+# BEHAVIOR
+#   Part 1 — Compare finalized-inventory to inventory.ini and list EXTRAS:
+#     hostnames that appear in inventory.ini but NOT in finalized-inventory.
+#   Part 2 — Prompt to remove those extra host lines from inventory.ini.
+#     Shows each server that would be deleted and the total delete count.
+#     A timestamped backup is written before any write.
+#
+# FINALIZED-INVENTORY FORMAT
+#   One hostname per line (preferred):
+#     sampleservera
+#     sampleserverb
+#     sampleserverc
+#   Ansible-style lines are also accepted (hostname = first field).
+#
+# INVENTORY.INI FORMAT
+#   Standard Ansible INI groups with ansible_host=, e.g.:
+#     [ocp151]
+#     sampleservera ansible_host=1.2.3.4
+#
+# EXIT CODES
+#   0  no extras, or extras removed successfully, or user declined removal
+#   1  setup/validation error or failed write
+#
+# MAINTENANCE
+#   Keep this comment block and inline comments in sync when behavior changes.
+#   Bump VERSION on each change.
+#==============================================================================
+
+set -euo pipefail
+
+FINALIZED_FILE="${1:-}"
+INVENTORY_FILE="${2:-}"
+
+#------------------------------------------------------------------------------
+# UI colors — only when stdout is a terminal
+#------------------------------------------------------------------------------
+if [ -t 1 ]; then
+  BOLD='\033[1m'
+  DIM='\033[2m'
+  GREEN='\033[0;32m'
+  RED='\033[0;31m'
+  YELLOW='\033[0;33m'
+  CYAN='\033[0;36m'
+  BLUE='\033[0;34m'
+  WHITE='\033[1;37m'
+  NC='\033[0m'
+else
+  BOLD='' DIM='' GREEN='' RED='' YELLOW='' CYAN='' BLUE='' WHITE='' NC=''
+fi
+
+HR="──────────────────────────────────────────────────────────────"
+
+usage() {
+  cat <<'EOF'
+Usage: ./compare-inventory.sh [finalized-inventory] [inventory.ini]
+
+Compare finalized-inventory to inventory.ini, show hostnames that exist only
+in inventory.ini (extras), then optionally remove those host lines from
+inventory.ini.
+
+Finalized file format (one hostname per line):
+  sampleservera
+  sampleserverb
+  sampleserverc
+EOF
+}
+
+expand_path() {
+  local path="$1"
+  case "$path" in
+    "~/"*) path="${HOME}/${path#~/}" ;;
+    "~") path="${HOME}" ;;
+  esac
+  printf '%s' "$path"
+}
+
+die() {
+  echo -e "${RED}ERROR${NC}  $*" >&2
+  exit 1
+}
+
+ask() {
+  local label="$1"
+  local default="${2:-}"
+  if [ -n "$default" ]; then
+    printf "      %b%s%b  %b%s%b " "$DIM" "$label" "$NC" "$CYAN" "[$default]" "$NC"
+  else
+    printf "      %b%s%b  " "$DIM" "$label" "$NC"
+  fi
+  read -r REPLY
+  if [ -z "$REPLY" ] && [ -n "$default" ]; then
+    REPLY="$default"
+  fi
+}
+
+confirm_ok() {
+  echo -e "      ${GREEN}✓${NC}  $*"
+}
+
+print_banner() {
+  echo
+  echo -e "${BOLD}${CYAN}${HR}${NC}"
+  echo -e "${BOLD}${WHITE}  Inventory Compare & Cleanup${NC}"
+  echo -e "${DIM}  Find extras in inventory.ini vs finalized-inventory${NC}"
+  echo -e "${BOLD}${CYAN}${HR}${NC}"
+  echo
+}
+
+#------------------------------------------------------------------------------
+# extract_hostnames — write unique hostnames from a file to stdout
+#   - skips blanks, comments, [section] headers
+#   - for "host ansible_host=..." takes field 1
+#   - for plain "hostname" lines takes the whole token
+#------------------------------------------------------------------------------
+extract_hostnames() {
+  local file="$1"
+  awk '
+    {
+      line = $0
+      sub(/\r$/, "", line)
+      gsub(/^[ \t]+|[ \t]+$/, "", line)
+      if (line == "" || line ~ /^[#;]/) next
+      if (line ~ /^\[[^]]+\]$/) next
+      host = $1
+      if (host != "") print host
+    }
+  ' "$file" | awk '!seen[$0]++'
+}
+
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+  usage
+  exit 0
+fi
+
+print_banner
+
+#------------------------------------------------------------------------------
+# Setup prompts
+#------------------------------------------------------------------------------
+echo -e "  ${BOLD}${BLUE}1/2${NC}  ${BOLD}Finalized inventory${NC}"
+if [ -z "$FINALIZED_FILE" ]; then
+  ask "Path" "finalized-inventory"
+  FINALIZED_FILE="$REPLY"
+fi
+FINALIZED_FILE="$(expand_path "$FINALIZED_FILE")"
+[ -n "$FINALIZED_FILE" ] && [ -f "$FINALIZED_FILE" ] || die "finalized inventory not found: ${FINALIZED_FILE:-<empty>}"
+confirm_ok "$FINALIZED_FILE"
+echo
+
+echo -e "  ${BOLD}${BLUE}2/2${NC}  ${BOLD}Inventory file${NC}"
+if [ -z "$INVENTORY_FILE" ]; then
+  ask "Path" "inventory.ini"
+  INVENTORY_FILE="$REPLY"
+fi
+INVENTORY_FILE="$(expand_path "$INVENTORY_FILE")"
+[ -n "$INVENTORY_FILE" ] && [ -f "$INVENTORY_FILE" ] || die "inventory file not found: ${INVENTORY_FILE:-<empty>}"
+[ -w "$INVENTORY_FILE" ] || die "inventory file is not writable: $INVENTORY_FILE"
+confirm_ok "$INVENTORY_FILE"
+echo
+
+#------------------------------------------------------------------------------
+# Temp workspace
+#------------------------------------------------------------------------------
+TMPDIR_WORK="$(mktemp -d)"
+trap 'rm -rf "$TMPDIR_WORK"' EXIT
+
+FINAL_HOSTS="$TMPDIR_WORK/final_hosts.txt"
+INV_HOSTS="$TMPDIR_WORK/inv_hosts.txt"
+EXTRAS="$TMPDIR_WORK/extras.txt"
+DELETE_LINES="$TMPDIR_WORK/delete_lines.txt"
+NEW_INVENTORY="$TMPDIR_WORK/inventory.new"
+
+extract_hostnames "$FINALIZED_FILE" > "$FINAL_HOSTS"
+extract_hostnames "$INVENTORY_FILE" > "$INV_HOSTS"
+
+final_count="$(wc -l < "$FINAL_HOSTS" | tr -d '[:space:]')"
+inv_count="$(wc -l < "$INV_HOSTS" | tr -d '[:space:]')"
+[ "$final_count" -gt 0 ] || die "no hostnames found in finalized inventory: $FINALIZED_FILE"
+[ "$inv_count" -gt 0 ] || die "no hostnames found in inventory: $INVENTORY_FILE"
+
+# Hostnames in inventory.ini but not in finalized-inventory
+awk 'NR==FNR { keep[$1]=1; next } !keep[$1] { print }' "$FINAL_HOSTS" "$INV_HOSTS" > "$EXTRAS"
+extra_host_count="$(wc -l < "$EXTRAS" | tr -d '[:space:]')"
+
+#------------------------------------------------------------------------------
+# Part 1 — show differences (extras in inventory.ini)
+#------------------------------------------------------------------------------
+echo -e "  ${BOLD}${CYAN}${HR}${NC}"
+echo -e "  ${BOLD}Part 1 · Differences${NC}"
+echo -e "  ${BOLD}${CYAN}${HR}${NC}"
+printf "  %-22s %s\n" "Finalized hosts" "$final_count"
+printf "  %-22s %s\n" "Inventory hostnames" "$inv_count"
+printf "  %-22s %s\n" "Extras in inventory" "$extra_host_count"
+echo -e "  ${DIM}(extra = present in inventory.ini, missing from finalized-inventory)${NC}"
+echo
+
+if [ "$extra_host_count" -eq 0 ]; then
+  echo -e "  ${GREEN}No extras found.${NC} inventory.ini matches finalized-inventory hostnames."
+  echo
+  exit 0
+fi
+
+echo -e "  ${BOLD}${YELLOW}Extra hostnames (in inventory.ini only)${NC}"
+while IFS= read -r host || [ -n "$host" ]; do
+  [ -n "$host" ] || continue
+  printf "    · %s\n" "$host"
+done < "$EXTRAS"
+echo
+
+# Build a detailed list of inventory LINES that will be deleted (hostname match).
+# Format: section<TAB>hostname<TAB>ip_or_-
+awk -v extras_file="$EXTRAS" '
+  BEGIN {
+    while ((getline h < extras_file) > 0) {
+      gsub(/^[ \t]+|[ \t]+$/, "", h)
+      if (h != "") extra[h] = 1
+    }
+    close(extras_file)
+    section = "ungrouped"
+  }
+  {
+    line = $0
+    raw = $0
+    sub(/\r$/, "", line)
+    trim = line
+    gsub(/^[ \t]+|[ \t]+$/, "", trim)
+    if (trim == "" || trim ~ /^[#;]/) next
+    if (trim ~ /^\[[^]]+\]$/) {
+      section = trim
+      sub(/^\[/, "", section)
+      sub(/\]$/, "", section)
+      next
+    }
+    host = $1
+    if (!(host in extra)) next
+    ip = "-"
+    for (i = 2; i <= NF; i++) {
+      if ($i ~ /^ansible_host=/) {
+        ip = substr($i, index($i, "=") + 1)
+        break
+      }
+    }
+    printf "%s\t%s\t%s\n", section, host, ip
+  }
+' "$INVENTORY_FILE" > "$DELETE_LINES"
+
+delete_count="$(wc -l < "$DELETE_LINES" | tr -d '[:space:]')"
+
+#------------------------------------------------------------------------------
+# Part 2 — prompt for removal from inventory.ini
+#------------------------------------------------------------------------------
+echo -e "  ${BOLD}${CYAN}${HR}${NC}"
+echo -e "  ${BOLD}Part 2 · Removal preview${NC}"
+echo -e "  ${BOLD}${CYAN}${HR}${NC}"
+echo -e "  Servers that do ${BOLD}not${NC} exist in finalized-inventory"
+echo -e "  will be deleted from ${BOLD}inventory.ini${NC}:"
+echo
+printf "  ${DIM}%-18s  %-22s  %s${NC}\n" "SECTION" "HOSTNAME" "IP"
+printf "  ${DIM}%-18s  %-22s  %s${NC}\n" "-------" "--------" "--"
+
+while IFS="$(printf '\t')" read -r section host ip || [ -n "${section:-}" ]; do
+  [ -n "${section:-}" ] || continue
+  printf "  %-18s  %-22s  %s\n" "$section" "$host" "$ip"
+done < "$DELETE_LINES"
+
+echo
+echo -e "  ${BOLD}${RED}Total servers to delete from inventory.ini: ${delete_count}${NC}"
+echo -e "  ${DIM}Unique extra hostnames: ${extra_host_count}${NC}"
+echo
+
+ask "Remove these servers from inventory.ini? (y/N)" "N"
+ANSWER="$(printf '%s' "$REPLY" | tr '[:upper:]' '[:lower:]')"
+
+if [ "$ANSWER" != "y" ] && [ "$ANSWER" != "yes" ]; then
+  echo
+  echo -e "  ${YELLOW}No changes made.${NC} inventory.ini left untouched."
+  echo
+  exit 0
+fi
+
+# Rewrite inventory.ini: drop host lines whose hostname is in the extras set.
+# Keep section headers, comments, and blanks; drop empty sections afterward.
+awk -v extras_file="$EXTRAS" '
+  BEGIN {
+    while ((getline h < extras_file) > 0) {
+      gsub(/^[ \t]+|[ \t]+$/, "", h)
+      if (h != "") extra[h] = 1
+    }
+    close(extras_file)
+  }
+  {
+    line = $0
+    sub(/\r$/, "", line)
+    trim = line
+    gsub(/^[ \t]+|[ \t]+$/, "", trim)
+
+    # Always keep blank / comment lines for now (cleaned later)
+    if (trim == "" || trim ~ /^[#;]/) {
+      print line
+      next
+    }
+
+    # Section headers — keep for now
+    if (trim ~ /^\[[^]]+\]$/) {
+      print line
+      next
+    }
+
+    host = $1
+    if (host in extra) next   # delete this host line
+    print line
+  }
+' "$INVENTORY_FILE" > "$NEW_INVENTORY.raw"
+
+# Remove section headers that have no host lines underneath (and tidy blanks).
+awk '
+  function flush_section(   j) {
+    if (!have_section) return
+    if (host_count > 0) {
+      print section_line
+      for (j = 1; j <= buf_n; j++) print buf[j]
+      if (pending_blank) print ""
+    }
+    have_section = 0
+    host_count = 0
+    buf_n = 0
+    pending_blank = 0
+  }
+  {
+    line = $0
+    sub(/\r$/, "", line)
+    trim = line
+    gsub(/^[ \t]+|[ \t]+$/, "", trim)
+
+    if (trim ~ /^\[[^]]+\]$/) {
+      flush_section()
+      section_line = line
+      have_section = 1
+      host_count = 0
+      buf_n = 0
+      pending_blank = 0
+      next
+    }
+
+    if (trim == "") {
+      if (have_section) pending_blank = 1
+      else if (printed_any) print ""
+      next
+    }
+
+    if (trim ~ /^[#;]/) {
+      if (have_section) {
+        buf[++buf_n] = line
+      } else {
+        print line
+        printed_any = 1
+      }
+      next
+    }
+
+    # Host (or other content) line
+    if (have_section) {
+      buf[++buf_n] = line
+      host_count++
+      pending_blank = 0
+    } else {
+      print line
+      printed_any = 1
+    }
+  }
+  END { flush_section() }
+' "$NEW_INVENTORY.raw" > "$NEW_INVENTORY"
+
+# Backup then replace
+BACKUP="${INVENTORY_FILE}.bak.$(date +%Y%m%d%H%M%S)"
+cp "$INVENTORY_FILE" "$BACKUP"
+cp "$NEW_INVENTORY" "$INVENTORY_FILE"
+
+echo
+echo -e "  ${GREEN}Removed ${delete_count} server line(s) from inventory.ini${NC}"
+echo -e "  ${DIM}Backup saved to ${BACKUP}${NC}"
+echo
+exit 0
