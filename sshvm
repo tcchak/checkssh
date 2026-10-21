@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+#
+# Read an Ansible-style inventory, extract ansible_host IPs, and test SSH.
+#
+# Usage:
+#   ./test-ssh-inventory.sh [inventory_file]
+#
+set -euo pipefail
+
+INVENTORY_FILE="${1:-}"
+TIMEOUT="${SSH_CONNECT_TIMEOUT:-5}"
+
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+usage() {
+  cat <<'EOF'
+Usage: ./test-ssh-inventory.sh [inventory_file]
+
+Reads hosts with ansible_host=<ip> from an Ansible inventory file,
+prompts for SSH port and private key path, then tests SSH to each host.
+
+Environment:
+  SSH_CONNECT_TIMEOUT  Connect timeout in seconds (default: 5)
+  SSH_USER             Default SSH user (also prompted)
+  SSH_PRIVATE_KEY      Default private key path (also prompted)
+EOF
+}
+
+# Expand leading ~ in a path (e.g. ~/.ssh/id_rsa)
+expand_path() {
+  local path="$1"
+  case "$path" in
+    "~/"*) path="${HOME}/${path#~/}" ;;
+    "~") path="${HOME}" ;;
+  esac
+  printf '%s' "$path"
+}
+
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+  usage
+  exit 0
+fi
+
+# Prompt for inventory if not provided
+if [ -z "$INVENTORY_FILE" ]; then
+  printf "Path to inventory file: "
+  read -r INVENTORY_FILE
+fi
+
+INVENTORY_FILE="$(expand_path "$INVENTORY_FILE")"
+
+if [ -z "$INVENTORY_FILE" ] || [ ! -f "$INVENTORY_FILE" ]; then
+  echo "Error: inventory file not found: ${INVENTORY_FILE:-<empty>}" >&2
+  exit 1
+fi
+
+# Prompt for SSH port before executing tests
+DEFAULT_PORT=22
+printf "SSH port number [%s]: " "$DEFAULT_PORT"
+read -r SSH_PORT
+SSH_PORT="${SSH_PORT:-$DEFAULT_PORT}"
+
+case "$SSH_PORT" in
+  ''|*[!0-9]*)
+    echo "Error: invalid port: $SSH_PORT" >&2
+    exit 1
+    ;;
+esac
+if [ "$SSH_PORT" -lt 1 ] || [ "$SSH_PORT" -gt 65535 ]; then
+  echo "Error: invalid port: $SSH_PORT" >&2
+  exit 1
+fi
+
+# Prompt for private key location
+DEFAULT_KEY="${SSH_PRIVATE_KEY:-${HOME}/.ssh/id_rsa}"
+printf "Private key path [%s]: " "$DEFAULT_KEY"
+read -r PRIVATE_KEY_INPUT
+PRIVATE_KEY="$(expand_path "${PRIVATE_KEY_INPUT:-$DEFAULT_KEY}")"
+
+if [ -z "$PRIVATE_KEY" ] || [ ! -f "$PRIVATE_KEY" ]; then
+  echo "Error: private key not found: ${PRIVATE_KEY:-<empty>}" >&2
+  exit 1
+fi
+if [ ! -r "$PRIVATE_KEY" ]; then
+  echo "Error: private key is not readable: $PRIVATE_KEY" >&2
+  exit 1
+fi
+
+DEFAULT_USER="${SSH_USER:-$(whoami)}"
+printf "SSH user [%s]: " "$DEFAULT_USER"
+read -r SSH_USER_INPUT
+SSH_USER="${SSH_USER_INPUT:-$DEFAULT_USER}"
+
+echo
+echo -e "${CYAN}Inventory:${NC} $INVENTORY_FILE"
+echo -e "${CYAN}Port:${NC}      $SSH_PORT"
+echo -e "${CYAN}Key:${NC}       $PRIVATE_KEY"
+echo -e "${CYAN}User:${NC}      $SSH_USER"
+echo -e "${CYAN}Timeout:${NC}   ${TIMEOUT}s"
+echo
+
+pass=0
+fail=0
+total=0
+
+echo "Testing SSH..."
+echo "----------------------------------------"
+
+# Parse inventory: skip comments, blanks, and [group] headers.
+# Supports: hostname ansible_host=1.2.3.4  (extra vars allowed on the same line)
+while IFS= read -r line || [ -n "$line" ]; do
+  # Trim leading whitespace
+  line="$(printf '%s' "$line" | sed -E 's/^[[:space:]]+//')"
+
+  case "$line" in
+    ''|\#*|\;*|\[*) continue ;;
+  esac
+
+  printf '%s' "$line" | grep -q 'ansible_host=' || continue
+
+  hostname="$(printf '%s' "$line" | awk '{print $1}')"
+  ip="$(printf '%s' "$line" | sed -nE 's/.*ansible_host=([^[:space:]]+).*/\1/p')"
+
+  if [ -z "$ip" ]; then
+    echo -e "${YELLOW}SKIP ${NC} $hostname  (no ansible_host)"
+    continue
+  fi
+
+  total=$((total + 1))
+
+  # BatchMode avoids password prompts; IdentitiesOnly forces the keyed identity.
+  set +e
+  ssh_output="$(
+    ssh -i "$PRIVATE_KEY" \
+      -p "$SSH_PORT" \
+      -o BatchMode=yes \
+      -o IdentitiesOnly=yes \
+      -o PreferredAuthentications=publickey \
+      -o PasswordAuthentication=no \
+      -o ConnectTimeout="$TIMEOUT" \
+      -o ConnectionAttempts=1 \
+      -o StrictHostKeyChecking=accept-new \
+      -o UserKnownHostsFile=/dev/null \
+      -o LogLevel=ERROR \
+      "${SSH_USER}@${ip}" \
+      exit 2>&1
+  )"
+  ssh_rc=$?
+  set -e
+
+  if [ "$ssh_rc" -eq 0 ]; then
+    status="OK"
+    detail="SSH reachable (authenticated)"
+    pass=$((pass + 1))
+    color="$GREEN"
+  elif printf '%s' "$ssh_output" | grep -qiE 'Permission denied|Authentication failed|publickey'; then
+    # Port answered with SSH; key was rejected (service is still up)
+    status="OK"
+    detail="SSH reachable (auth failed - service is up)"
+    pass=$((pass + 1))
+    color="$GREEN"
+  else
+    status="FAIL"
+    detail="$(printf '%s' "${ssh_output:-connection failed (rc=$ssh_rc)}" | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g' | cut -c1-120)"
+    fail=$((fail + 1))
+    color="$RED"
+  fi
+
+  printf "%b%-5s%b %-20s %-15s %s\n" "$color" "$status" "$NC" "$hostname" "$ip" "$detail"
+done < "$INVENTORY_FILE"
+
+echo "----------------------------------------"
+
+if [ "$total" -eq 0 ]; then
+  echo "No hosts with ansible_host= found in $INVENTORY_FILE" >&2
+  exit 1
+fi
+
+echo -e "Result: ${GREEN}${pass} passed${NC}, ${RED}${fail} failed${NC}, ${YELLOW}${total} total${NC}"
+
+if [ "$fail" -gt 0 ]; then
+  exit 1
+fi
+exit 0
