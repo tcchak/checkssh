@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 #
 # Read an Ansible-style inventory, extract ansible_host IPs, and test SSH.
-# Intended for RHEL 8.10 (bash 4.x) and compatible with macOS bash 3.2.
 #
 # Usage:
 #   ./test-ssh-inventory.sh [inventory_file]
@@ -22,12 +21,11 @@ usage() {
 Usage: ./test-ssh-inventory.sh [inventory_file]
 
 Reads hosts with ansible_host=<ip> from an Ansible inventory file,
-prompts for SSH port, private key, and landing user, then tests SSH
-to each host.
+prompts for SSH port and private key path, then tests SSH to each host.
 
 Environment:
   SSH_CONNECT_TIMEOUT  Connect timeout in seconds (default: 5)
-  SSH_USER             Default landing user (also prompted)
+  SSH_USER             Default SSH user (also prompted)
   SSH_PRIVATE_KEY      Default private key path (also prompted)
 EOF
 }
@@ -92,55 +90,35 @@ if [ ! -r "$PRIVATE_KEY" ]; then
   exit 1
 fi
 
-# Prompt for landing user (account used to log in to each server)
-DEFAULT_USER="${SSH_USER:-}"
-if [ -n "$DEFAULT_USER" ]; then
-  printf "Landing user (login account) [%s]: " "$DEFAULT_USER"
-else
-  printf "Landing user (login account): "
-fi
+DEFAULT_USER="${SSH_USER:-$(whoami)}"
+printf "SSH user [%s]: " "$DEFAULT_USER"
 read -r SSH_USER_INPUT
 SSH_USER="${SSH_USER_INPUT:-$DEFAULT_USER}"
 
-if [ -z "$SSH_USER" ]; then
-  echo "Error: landing user is required" >&2
-  exit 1
-fi
-
 echo
-echo -e "${CYAN}Inventory:${NC}    $INVENTORY_FILE"
-echo -e "${CYAN}Port:${NC}         $SSH_PORT"
-echo -e "${CYAN}Key:${NC}          $PRIVATE_KEY"
-echo -e "${CYAN}Landing user:${NC} $SSH_USER"
-echo -e "${CYAN}Timeout:${NC}      ${TIMEOUT}s"
+echo -e "${CYAN}Inventory:${NC} $INVENTORY_FILE"
+echo -e "${CYAN}Port:${NC}      $SSH_PORT"
+echo -e "${CYAN}Key:${NC}       $PRIVATE_KEY"
+echo -e "${CYAN}User:${NC}      $SSH_USER"
+echo -e "${CYAN}Timeout:${NC}   ${TIMEOUT}s"
 echo
 
 pass=0
 fail=0
 total=0
-current_section="(ungrouped)"
 
-echo "Testing SSH across all inventory sections..."
+echo "Testing SSH..."
 echo "----------------------------------------"
 
-# Parse every section in the inventory.
+# Parse inventory: skip comments, blanks, and [group] headers.
 # Supports: hostname ansible_host=1.2.3.4  (extra vars allowed on the same line)
-# ssh -n is required so SSH does not consume the inventory from stdin.
 while IFS= read -r line || [ -n "$line" ]; do
   # Trim leading whitespace
   line="$(printf '%s' "$line" | sed -E 's/^[[:space:]]+//')"
 
   case "$line" in
-    ''|\#*|\;*) continue ;;
+    ''|\#*|\;*|\[*) continue ;;
   esac
-
-  # Track [section] headers and keep scanning subsequent sections
-  if printf '%s' "$line" | grep -qE '^\[.+\]$'; then
-    current_section="$(printf '%s' "$line" | sed -E 's/^\[//; s/\]$//')"
-    echo
-    echo -e "${CYAN}[section] ${current_section}${NC}"
-    continue
-  fi
 
   printf '%s' "$line" | grep -q 'ansible_host=' || continue
 
@@ -155,11 +133,9 @@ while IFS= read -r line || [ -n "$line" ]; do
   total=$((total + 1))
 
   # BatchMode avoids password prompts; IdentitiesOnly forces the keyed identity.
-  # ssh -n prevents SSH from reading the inventory file on stdin (which would
-  # stop the while-read loop after the first host).
   set +e
   ssh_output="$(
-    ssh -n -i "$PRIVATE_KEY" \
+    ssh -i "$PRIVATE_KEY" \
       -p "$SSH_PORT" \
       -o BatchMode=yes \
       -o IdentitiesOnly=yes \
@@ -194,8 +170,7 @@ while IFS= read -r line || [ -n "$line" ]; do
     color="$RED"
   fi
 
-  printf "%b%-5s%b %-20s %-15s [%s] %s\n" \
-    "$color" "$status" "$NC" "$hostname" "$ip" "$current_section" "$detail"
+  printf "%b%-5s%b %-20s %-15s %s\n" "$color" "$status" "$NC" "$hostname" "$ip" "$detail"
 done < "$INVENTORY_FILE"
 
 echo "----------------------------------------"
