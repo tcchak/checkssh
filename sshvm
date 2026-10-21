@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #==============================================================================
 # test-ssh-inventory.sh
-# VERSION: 1.1.2
+# VERSION: 1.2.0
 #------------------------------------------------------------------------------
 # TARGET ENVIRONMENT
 #   - Primary: RHEL 8.10 (bash 4.x, OpenSSH)
@@ -11,11 +11,17 @@
 #   ./test-ssh-inventory.sh [inventory_file] [masterfile]
 #
 # PROMPTS (before any SSH tests run)
-#   1) Inventory file path   (skipped if passed as $1)
+#   1) Inventory file path   (skipped if passed as $1; default: inventory.ini)
 #   2) Master file path      (skipped if passed as $2; default: masterfile.txt)
-#   3) SSH port number       (default: 22)
+#   3) SSH port number       (default: 64022)
 #   4) Private key path      (default: $SSH_PRIVATE_KEY or ~/.ssh/id_rsa)
-#   5) Landing user          (account used to log in; required)
+#   5) Landing user          (default: redhat-chaos; or $SSH_USER)
+#
+# ROOT SWITCH CHECK (required for PASS)
+#   After SSH login, tests passwordless sudo to root via:
+#     1) sudo -n -i -- true
+#     2) fallback: sudo -n su -c true
+#   PASS requires SSH auth AND a successful root switch.
 #
 # MULTI-SECTION BEHAVIOR
 #   All [section] groups are parsed up front into a temp host list, then every
@@ -46,7 +52,7 @@
 #   MASTER_FILE          Default masterfile path (still prompted)
 #
 # EXIT CODES
-#   0  all hosts authenticated successfully
+#   0  all hosts passed (SSH auth + sudo root switch)
 #   1  one or more hosts failed (or setup/validation error)
 #
 # MAINTENANCE
@@ -95,7 +101,11 @@ Usage: ./test-ssh-inventory.sh [inventory_file] [masterfile]
 
 Reads hosts with ansible_host=<ip> from an Ansible inventory file,
 maps each host to an AppCode from masterfile.txt, prompts for SSH port,
-private key, and landing user, then tests SSH across all sections.
+private key, and landing user, then tests SSH and sudo-to-root across
+all sections.
+
+PASS requires authenticated SSH and passwordless sudo root switch
+(sudo -i, with sudo su fallback).
 
 Masterfile table format:
   Hostname IpAddress AppCode
@@ -136,7 +146,7 @@ print_banner() {
   echo
   echo -e "${BOLD}${CYAN}${HR}${NC}"
   echo -e "${BOLD}${WHITE}  SSH Inventory Connectivity Check${NC}"
-  echo -e "${DIM}  Authenticated SSH test across all inventory sections${NC}"
+  echo -e "${DIM}  SSH auth + sudo-to-root check across all inventory sections${NC}"
   echo -e "${BOLD}${CYAN}${HR}${NC}"
   echo
 }
@@ -285,7 +295,7 @@ print_banner
 # [1/5] Inventory file
 print_step 1 "Inventory file"
 if [ -z "$INVENTORY_FILE" ]; then
-  ask "Path to inventory file"
+  ask "Path to inventory file" "inventory.ini"
   INVENTORY_FILE="$REPLY"
 fi
 INVENTORY_FILE="$(expand_path "$INVENTORY_FILE")"
@@ -306,7 +316,7 @@ echo
 
 # [3/5] SSH port
 print_step 3 "SSH port"
-ask "Port number" "22"
+ask "Port number" "64022"
 SSH_PORT="$REPLY"
 case "$SSH_PORT" in
   ''|*[!0-9]*) die "invalid port: $SSH_PORT" ;;
@@ -326,11 +336,7 @@ echo
 
 # [5/5] Landing user (login account on the remote servers)
 print_step 5 "Landing user"
-if [ -n "${SSH_USER:-}" ]; then
-  ask "Login account" "$SSH_USER"
-else
-  ask "Login account"
-fi
+ask "Login account" "${SSH_USER:-redhat-chaos}"
 SSH_USER="$REPLY"
 [ -n "$SSH_USER" ] || die "landing user is required"
 echo -e "      ${GREEN}OK${NC}  $SSH_USER"
@@ -439,13 +445,17 @@ print_config
 
 echo -e "${BOLD}  Running tests across ${section_count} section(s), ${total} host(s)...${NC}"
 echo -e "${DIM}  Results include AppCode from masterfile (host+IP, then IP, then host).${NC}"
-echo -e "${DIM}  Success requires authenticated SSH (key + landing user).${NC}"
+echo -e "${DIM}  PASS requires SSH auth + passwordless sudo to root (sudo -i, else sudo su).${NC}"
 echo
 
 #------------------------------------------------------------------------------
-# Run SSH tests (index-based loop — see VERSION history / header notes)
+# Run SSH + sudo-to-root tests (index-based loop)
 #------------------------------------------------------------------------------
 set +e
+
+# Remote check: SSH session must authenticate, then switch to root without a
+# password prompt (-n). Try sudo -i first, then sudo su.
+REMOTE_ROOT_CHECK='if sudo -n -i -- true >/dev/null 2>&1; then echo SUDO_OK sudo_-i; elif sudo -n su -c true >/dev/null 2>&1; then echo SUDO_OK sudo_su; else echo SUDO_FAIL; exit 1; fi'
 
 i=1
 while [ "$i" -le "$total" ]; do
@@ -486,7 +496,7 @@ while [ "$i" -le "$total" ]; do
   #   UserKnownHostsFile=/dev/null
   #                       avoid polluting the real known_hosts file
   #
-  # PASS condition: ssh exit code 0 (session authenticated and remote exit ran).
+  # PASS: SSH authenticates AND remote sudo root switch succeeds.
   ssh_output="$(
     ssh -n -i "$PRIVATE_KEY" \
       -p "$SSH_PORT" \
@@ -500,21 +510,25 @@ while [ "$i" -le "$total" ]; do
       -o UserKnownHostsFile=/dev/null \
       -o LogLevel=ERROR \
       "${SSH_USER}@${ip}" \
-      "exit" < /dev/null 2>&1
+      "$REMOTE_ROOT_CHECK" < /dev/null 2>&1
   )"
   ssh_rc=$?
 
-  if [ "$ssh_rc" -eq 0 ]; then
-    # Authenticated successfully.
+  if [ "$ssh_rc" -eq 0 ] && printf '%s' "$ssh_output" | grep -q 'SUDO_OK'; then
+    # SSH auth + sudo root switch both succeeded.
+    sudo_method="$(printf '%s' "$ssh_output" | sed -n 's/.*SUDO_OK //p' | tr -d '\r' | awk 'NF{print $1; exit}')"
     status="PASS"
-    detail="authenticated"
+    detail="ssh+sudo ok (${sudo_method:-sudo})"
     pass=$((pass + 1))
     color="$GREEN"
   else
-    # Any non-zero is FAIL (including "service up but auth failed").
+    # Distinguish SSH failure vs sudo-to-root failure for the detail column.
     status="FAIL"
     if printf '%s' "$ssh_output" | grep -qiE 'Permission denied|Authentication failed|publickey'; then
       detail="authentication failed"
+    elif printf '%s' "$ssh_output" | grep -q 'SUDO_FAIL' \
+      || printf '%s' "$ssh_output" | grep -qiE 'sudo:[[:space:]]|a password is required|is not in the sudoers'; then
+      detail="sudo to root failed"
     else
       # Collapse multi-line ssh errors into one short detail field.
       detail="$(printf '%s' "${ssh_output:-connection failed (rc=$ssh_rc)}" | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g' | cut -c1-80)"
@@ -535,7 +549,7 @@ set -e
 
 print_summary
 
-# Non-zero exit if any host failed authentication/connectivity.
+# Non-zero exit if any host failed SSH auth or sudo root switch.
 if [ "$fail" -gt 0 ]; then
   exit 1
 fi
