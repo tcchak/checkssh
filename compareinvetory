@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #==============================================================================
 # compare-inventory.sh
-# VERSION: 1.0.1
+# VERSION: 1.1.0
 #------------------------------------------------------------------------------
 # TARGET ENVIRONMENT
 #   - Primary: RHEL 8.10 (bash 4.x)
@@ -16,11 +16,13 @@
 #   3) Confirm removal of extras (y/N) after differences are shown
 #
 # BEHAVIOR
-#   Part 1 — Compare finalized-inventory to inventory.ini and list EXTRAS:
-#     hostnames that appear in inventory.ini but NOT in finalized-inventory.
-#   Part 2 — Prompt to remove those extra host lines from inventory.ini.
+#   Part 1 — Cross-check both files (what each is missing from the other):
+#     A) In inventory.ini but NOT in finalized-inventory  (extras)
+#     B) In finalized-inventory but NOT in inventory.ini  (missing from inventory)
+#   Part 2 — Prompt to remove extras (A) from inventory.ini.
 #     Shows each server that would be deleted and the total delete count.
 #     A timestamped backup is written before any write.
+#     (Hosts only in finalized-inventory are reported, not auto-added.)
 #
 # SECTIONS ARE NOT SERVERS
 #   Lines in brackets such as [ocp151], [ocp151:vars], [ocp151:children]
@@ -78,9 +80,10 @@ usage() {
   cat <<'EOF'
 Usage: ./compare-inventory.sh [finalized-inventory] [inventory.ini]
 
-Compare finalized-inventory to inventory.ini, show hostnames that exist only
-in inventory.ini (extras), then optionally remove those host lines from
-inventory.ini.
+Cross-check finalized-inventory and inventory.ini:
+  - servers in inventory.ini but not in finalized-inventory (extras)
+  - hosts in finalized-inventory but not in inventory.ini (missing)
+Optionally remove extras from inventory.ini.
 
 Finalized file format (one hostname per line):
   sampleservera
@@ -223,7 +226,8 @@ trap 'rm -rf "$TMPDIR_WORK"' EXIT
 
 FINAL_HOSTS="$TMPDIR_WORK/final_hosts.txt"
 INV_HOSTS="$TMPDIR_WORK/inv_hosts.txt"
-EXTRAS="$TMPDIR_WORK/extras.txt"
+EXTRAS="$TMPDIR_WORK/extras.txt"          # in inventory.ini, not in finalized
+MISSING="$TMPDIR_WORK/missing.txt"        # in finalized, not in inventory.ini
 DELETE_LINES="$TMPDIR_WORK/delete_lines.txt"
 NEW_INVENTORY="$TMPDIR_WORK/inventory.new"
 
@@ -235,35 +239,64 @@ inv_count="$(wc -l < "$INV_HOSTS" | tr -d '[:space:]')"
 [ "$final_count" -gt 0 ] || die "no hostnames found in finalized inventory: $FINALIZED_FILE"
 [ "$inv_count" -gt 0 ] || die "no server hostnames (ansible_host=) found in inventory: $INVENTORY_FILE"
 
-# Hostnames in inventory.ini but not in finalized-inventory
+# A) in inventory.ini but NOT in finalized-inventory
 awk 'NR==FNR { keep[$1]=1; next } !keep[$1] { print }' "$FINAL_HOSTS" "$INV_HOSTS" > "$EXTRAS"
 extra_host_count="$(wc -l < "$EXTRAS" | tr -d '[:space:]')"
 
+# B) in finalized-inventory but NOT in inventory.ini
+awk 'NR==FNR { have[$1]=1; next } !have[$1] { print }' "$INV_HOSTS" "$FINAL_HOSTS" > "$MISSING"
+missing_host_count="$(wc -l < "$MISSING" | tr -d '[:space:]')"
+
 #------------------------------------------------------------------------------
-# Part 1 — show differences (extras in inventory.ini)
+# Part 1 — cross-check: what each file is missing from the other
 #------------------------------------------------------------------------------
 echo -e "  ${BOLD}${CYAN}${HR}${NC}"
-echo -e "  ${BOLD}Part 1 · Differences${NC}"
+echo -e "  ${BOLD}Part 1 · Cross-check${NC}"
 echo -e "  ${BOLD}${CYAN}${HR}${NC}"
-printf "  %-22s %s\n" "Finalized hosts" "$final_count"
-printf "  %-22s %s\n" "Inventory servers" "$inv_count"
-printf "  %-22s %s\n" "Extras in inventory" "$extra_host_count"
-echo -e "  ${DIM}(extra = server in inventory.ini, missing from finalized-inventory)${NC}"
+printf "  %-28s %s\n" "Finalized hosts" "$final_count"
+printf "  %-28s %s\n" "Inventory servers" "$inv_count"
+printf "  %-28s %s\n" "Only in inventory.ini" "$extra_host_count"
+printf "  %-28s %s\n" "Only in finalized-inventory" "$missing_host_count"
 echo -e "  ${DIM}[section] lines like [ocp151] are groups only — not counted as servers${NC}"
 echo
 
+# --- A) available in inventory.ini, not in finalized-inventory ---
+echo -e "  ${BOLD}${YELLOW}A) In inventory.ini · NOT in finalized-inventory${NC}"
+echo -e "  ${DIM}   (extras — candidates to remove from inventory.ini)${NC}"
 if [ "$extra_host_count" -eq 0 ]; then
-  echo -e "  ${GREEN}No extras found.${NC} inventory.ini matches finalized-inventory hostnames."
+  echo -e "      ${GREEN}none${NC}"
+else
+  while IFS= read -r host || [ -n "$host" ]; do
+    [ -n "$host" ] || continue
+    printf "      · %s\n" "$host"
+  done < "$EXTRAS"
+fi
+echo
+
+# --- B) available in finalized-inventory, not in inventory.ini ---
+echo -e "  ${BOLD}${YELLOW}B) In finalized-inventory · NOT in inventory.ini${NC}"
+echo -e "  ${DIM}   (missing from inventory.ini — not auto-added)${NC}"
+if [ "$missing_host_count" -eq 0 ]; then
+  echo -e "      ${GREEN}none${NC}"
+else
+  while IFS= read -r host || [ -n "$host" ]; do
+    [ -n "$host" ] || continue
+    printf "      · %s\n" "$host"
+  done < "$MISSING"
+fi
+echo
+
+if [ "$extra_host_count" -eq 0 ] && [ "$missing_host_count" -eq 0 ]; then
+  echo -e "  ${GREEN}Files match.${NC} No hostname differences between the two lists."
   echo
   exit 0
 fi
 
-echo -e "  ${BOLD}${YELLOW}Extra hostnames (in inventory.ini only)${NC}"
-while IFS= read -r host || [ -n "$host" ]; do
-  [ -n "$host" ] || continue
-  printf "    · %s\n" "$host"
-done < "$EXTRAS"
-echo
+if [ "$extra_host_count" -eq 0 ]; then
+  echo -e "  ${DIM}No extras in inventory.ini — skipping removal step.${NC}"
+  echo
+  exit 0
+fi
 
 # Build a detailed list of inventory SERVER LINES that will be deleted.
 # Format: section<TAB>hostname<TAB>ip
@@ -309,13 +342,13 @@ awk -v extras_file="$EXTRAS" '
 delete_count="$(wc -l < "$DELETE_LINES" | tr -d '[:space:]')"
 
 #------------------------------------------------------------------------------
-# Part 2 — prompt for removal from inventory.ini
+# Part 2 — prompt for removal of extras from inventory.ini
 #------------------------------------------------------------------------------
 echo -e "  ${BOLD}${CYAN}${HR}${NC}"
-echo -e "  ${BOLD}Part 2 · Removal preview${NC}"
+echo -e "  ${BOLD}Part 2 · Removal preview (extras only)${NC}"
 echo -e "  ${BOLD}${CYAN}${HR}${NC}"
-echo -e "  Servers that do ${BOLD}not${NC} exist in finalized-inventory"
-echo -e "  will be deleted from ${BOLD}inventory.ini${NC}:"
+echo -e "  Servers in inventory.ini that are ${BOLD}not${NC} in finalized-inventory"
+echo -e "  can be deleted from ${BOLD}inventory.ini${NC}:"
 echo
 printf "  ${DIM}%-18s  %-22s  %s${NC}\n" "SECTION" "HOSTNAME" "IP"
 printf "  ${DIM}%-18s  %-22s  %s${NC}\n" "-------" "--------" "--"
@@ -328,9 +361,12 @@ done < "$DELETE_LINES"
 echo
 echo -e "  ${BOLD}${RED}Total servers to delete from inventory.ini: ${delete_count}${NC}"
 echo -e "  ${DIM}Unique extra hostnames: ${extra_host_count}${NC}"
+if [ "$missing_host_count" -gt 0 ]; then
+  echo -e "  ${DIM}Note: ${missing_host_count} host(s) only in finalized-inventory were not added.${NC}"
+fi
 echo
 
-ask "Remove these servers from inventory.ini? (y/N)" "N"
+ask "Remove these extras from inventory.ini? (y/N)" "N"
 ANSWER="$(printf '%s' "$REPLY" | tr '[:upper:]' '[:lower:]')"
 
 if [ "$ANSWER" != "y" ] && [ "$ANSWER" != "yes" ]; then
