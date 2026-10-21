@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #==============================================================================
 # test-ssh-inventory.sh
-# VERSION: 1.2.0
+# VERSION: 1.2.1
 #------------------------------------------------------------------------------
 # TARGET ENVIRONMENT
 #   - Primary: RHEL 8.10 (bash 4.x, OpenSSH)
@@ -145,8 +145,8 @@ die() {
 print_banner() {
   echo
   echo -e "${BOLD}${CYAN}${HR}${NC}"
-  echo -e "${BOLD}${WHITE}  SSH Inventory Connectivity Check${NC}"
-  echo -e "${DIM}  SSH auth + sudo-to-root check across all inventory sections${NC}"
+  echo -e "${BOLD}${WHITE}  SSH Inventory Check${NC}"
+  echo -e "${DIM}  Verify login and root access for every host in inventory${NC}"
   echo -e "${BOLD}${CYAN}${HR}${NC}"
   echo
 }
@@ -157,7 +157,7 @@ print_banner() {
 print_step() {
   local num="$1"
   local title="$2"
-  echo -e "${BOLD}${BLUE}[$num/5]${NC} ${BOLD}${title}${NC}"
+  echo -e "  ${BOLD}${BLUE}${num}/5${NC}  ${BOLD}${title}${NC}"
 }
 
 #------------------------------------------------------------------------------
@@ -169,14 +169,21 @@ ask() {
   local label="$1"
   local default="${2:-}"
   if [ -n "$default" ]; then
-    printf "      %b%s%b %b[%s]%b: " "$DIM" "$label" "$NC" "$CYAN" "$default" "$NC"
+    printf "      %b%s%b  %b%s%b " "$DIM" "$label" "$NC" "$CYAN" "[$default]" "$NC"
   else
-    printf "      %b%s%b: " "$DIM" "$label" "$NC"
+    printf "      %b%s%b  " "$DIM" "$label" "$NC"
   fi
   read -r REPLY
   if [ -z "$REPLY" ] && [ -n "$default" ]; then
     REPLY="$default"
   fi
+}
+
+#------------------------------------------------------------------------------
+# confirm_ok — compact confirmation under a setup prompt
+#------------------------------------------------------------------------------
+confirm_ok() {
+  echo -e "      ${GREEN}✓${NC}  $*"
 }
 
 #------------------------------------------------------------------------------
@@ -208,35 +215,34 @@ lookup_app_code() {
 #------------------------------------------------------------------------------
 print_config() {
   echo
-  echo -e "${BOLD}${CYAN}${HR_THIN}${NC}"
-  echo -e "${BOLD}  Configuration${NC}"
-  echo -e "${BOLD}${CYAN}${HR_THIN}${NC}"
-  printf "  %-14s %s\n" "Inventory" "$INVENTORY_FILE"
-  printf "  %-14s %s\n" "Masterfile" "$MASTER_FILE"
-  printf "  %-14s %s\n" "AppCodes" "$master_count mapping(s)"
-  printf "  %-14s %s\n" "Port" "$SSH_PORT"
-  printf "  %-14s %s\n" "Private key" "$PRIVATE_KEY"
-  printf "  %-14s %s\n" "Landing user" "$SSH_USER"
-  printf "  %-14s %ss\n" "Timeout" "$TIMEOUT"
-  printf "  %-14s %s\n" "Sections" "$section_count"
-  printf "  %-14s %s host(s)\n" "Targets" "$total"
-  echo -e "${BOLD}${CYAN}${HR_THIN}${NC}"
+  echo -e "  ${BOLD}${CYAN}${HR_THIN}${NC}"
+  echo -e "  ${BOLD}Ready to run${NC}"
+  echo -e "  ${BOLD}${CYAN}${HR_THIN}${NC}"
+  printf "  %-16s %s\n" "Inventory" "$INVENTORY_FILE"
+  printf "  %-16s %s\n" "Masterfile" "$MASTER_FILE"
+  printf "  %-16s %s mapping(s)\n" "App codes" "$master_count"
+  printf "  %-16s %s\n" "SSH port" "$SSH_PORT"
+  printf "  %-16s %s\n" "Private key" "$PRIVATE_KEY"
+  printf "  %-16s %s\n" "Landing user" "$SSH_USER"
+  printf "  %-16s %ss\n" "Timeout" "$TIMEOUT"
+  printf "  %-16s %s section(s), %s host(s)\n" "Scope" "$section_count" "$total"
+  echo -e "  ${DIM}Checks${NC}           SSH login  →  passwordless root (sudo -i, else sudo su)"
+  echo -e "  ${BOLD}${CYAN}${HR_THIN}${NC}"
 
   # List each section and how many hosts it contributed (inventory order).
   if [ -s "$HOST_LIST" ]; then
-    echo -e "  ${DIM}Sections to test:${NC}"
+    echo -e "  ${DIM}Sections${NC}"
     awk -F '\t' '
       { count[$1]++; if (!seen[$1]++) order[++n] = $1 }
       END {
         for (i = 1; i <= n; i++) {
           s = order[i]
-          printf "    - %-20s (%s host(s))\n", s, count[s]
+          printf "    · %-18s  %s host(s)\n", s, count[s]
         }
       }
     ' "$HOST_LIST"
+    echo -e "  ${BOLD}${CYAN}${HR_THIN}${NC}"
   fi
-
-  echo -e "${BOLD}${CYAN}${HR_THIN}${NC}"
   echo
 }
 
@@ -244,35 +250,42 @@ print_config() {
 # print_table_header — column headers for per-section result rows
 #------------------------------------------------------------------------------
 print_table_header() {
-  printf "  ${DIM}%-6s  %-8s  %-22s  %-15s  %s${NC}\n" \
-    "STATUS" "APPCODE" "HOST" "IP" "DETAIL"
-  printf "  ${DIM}%-6s  %-8s  %-22s  %-15s  %s${NC}\n" \
-    "------" "-------" "----" "--" "------"
+  printf "  ${DIM}%-4s  %-6s  %-8s  %-20s  %-15s  %s${NC}\n" \
+    "#" "STATUS" "APP" "HOST" "IP" "RESULT"
+  printf "  ${DIM}%-4s  %-6s  %-8s  %-20s  %-15s  %s${NC}\n" \
+    "--" "------" "---" "----" "--" "------"
 }
 
 #------------------------------------------------------------------------------
 # print_summary — final pass/fail totals and overall label
 #------------------------------------------------------------------------------
 print_summary() {
-  local overall_color overall_label
+  local overall_color overall_label pct
+  if [ "$total" -gt 0 ]; then
+    pct=$((pass * 100 / total))
+  else
+    pct=0
+  fi
+
   if [ "$fail" -eq 0 ]; then
     overall_color="$GREEN"
-    overall_label="ALL PASSED"
+    overall_label="All hosts passed"
   else
     overall_color="$RED"
-    overall_label="FAILURES DETECTED"
+    overall_label="Completed with failures"
   fi
 
   echo
-  echo -e "${BOLD}${CYAN}${HR}${NC}"
-  echo -e "${BOLD}  Summary${NC}"
-  echo -e "${BOLD}${CYAN}${HR}${NC}"
-  printf "  %-12s %b%s%b\n" "Passed" "${GREEN}" "$pass" "${NC}"
-  printf "  %-12s %b%s%b\n" "Failed" "${RED}" "$fail" "${NC}"
-  printf "  %-12s %s\n" "Total" "$total"
+  echo -e "  ${BOLD}${CYAN}${HR}${NC}"
+  echo -e "  ${BOLD}Summary${NC}"
+  echo -e "  ${BOLD}${CYAN}${HR}${NC}"
+  printf "  %-12s %b%s%b\n" "Passed" "${GREEN}${BOLD}" "$pass" "${NC}"
+  printf "  %-12s %b%s%b\n" "Failed" "${RED}${BOLD}" "$fail" "${NC}"
+  printf "  %-12s %s  (%s%% passed)\n" "Total" "$total" "$pct"
   echo
-  echo -e "  Overall: ${BOLD}${overall_color}${overall_label}${NC}"
-  echo -e "${BOLD}${CYAN}${HR}${NC}"
+  echo -e "  ${BOLD}${overall_color}${overall_label}${NC}"
+  echo -e "  ${DIM}Each pass = SSH login OK and root switch OK${NC}"
+  echo -e "  ${BOLD}${CYAN}${HR}${NC}"
   echo
 }
 
@@ -295,51 +308,51 @@ print_banner
 # [1/5] Inventory file
 print_step 1 "Inventory file"
 if [ -z "$INVENTORY_FILE" ]; then
-  ask "Path to inventory file" "inventory.ini"
+  ask "Path" "inventory.ini"
   INVENTORY_FILE="$REPLY"
 fi
 INVENTORY_FILE="$(expand_path "$INVENTORY_FILE")"
 [ -n "$INVENTORY_FILE" ] && [ -f "$INVENTORY_FILE" ] || die "inventory file not found: ${INVENTORY_FILE:-<empty>}"
-echo -e "      ${GREEN}OK${NC}  $INVENTORY_FILE"
+confirm_ok "$INVENTORY_FILE"
 echo
 
 # [2/5] Masterfile (Hostname IpAddress AppCode)
 print_step 2 "Masterfile (AppCode map)"
 if [ -z "$MASTER_FILE" ]; then
-  ask "Path to masterfile" "masterfile.txt"
+  ask "Path" "masterfile.txt"
   MASTER_FILE="$REPLY"
 fi
 MASTER_FILE="$(expand_path "$MASTER_FILE")"
 [ -n "$MASTER_FILE" ] && [ -f "$MASTER_FILE" ] || die "masterfile not found: ${MASTER_FILE:-<empty>}"
-echo -e "      ${GREEN}OK${NC}  $MASTER_FILE"
+confirm_ok "$MASTER_FILE"
 echo
 
 # [3/5] SSH port
 print_step 3 "SSH port"
-ask "Port number" "64022"
+ask "Port" "64022"
 SSH_PORT="$REPLY"
 case "$SSH_PORT" in
   ''|*[!0-9]*) die "invalid port: $SSH_PORT" ;;
 esac
 [ "$SSH_PORT" -ge 1 ] && [ "$SSH_PORT" -le 65535 ] || die "invalid port: $SSH_PORT"
-echo -e "      ${GREEN}OK${NC}  port $SSH_PORT"
+confirm_ok "port $SSH_PORT"
 echo
 
 # [4/5] Private key used for publickey auth
 print_step 4 "Private key"
-ask "Key path" "${SSH_PRIVATE_KEY:-${HOME}/.ssh/id_rsa}"
+ask "Path" "${SSH_PRIVATE_KEY:-${HOME}/.ssh/id_rsa}"
 PRIVATE_KEY="$(expand_path "$REPLY")"
 [ -n "$PRIVATE_KEY" ] && [ -f "$PRIVATE_KEY" ] || die "private key not found: ${PRIVATE_KEY:-<empty>}"
 [ -r "$PRIVATE_KEY" ] || die "private key is not readable: $PRIVATE_KEY"
-echo -e "      ${GREEN}OK${NC}  $PRIVATE_KEY"
+confirm_ok "$PRIVATE_KEY"
 echo
 
 # [5/5] Landing user (login account on the remote servers)
 print_step 5 "Landing user"
-ask "Login account" "${SSH_USER:-redhat-chaos}"
+ask "Account" "${SSH_USER:-redhat-chaos}"
 SSH_USER="$REPLY"
 [ -n "$SSH_USER" ] || die "landing user is required"
-echo -e "      ${GREEN}OK${NC}  $SSH_USER"
+confirm_ok "$SSH_USER"
 echo
 
 #------------------------------------------------------------------------------
@@ -443,9 +456,12 @@ section_count="$(awk -F '\t' '!seen[$1]++ { c++ } END { print c+0 }' "$HOST_LIST
 
 print_config
 
-echo -e "${BOLD}  Running tests across ${section_count} section(s), ${total} host(s)...${NC}"
-echo -e "${DIM}  Results include AppCode from masterfile (host+IP, then IP, then host).${NC}"
-echo -e "${DIM}  PASS requires SSH auth + passwordless sudo to root (sudo -i, else sudo su).${NC}"
+# Brief pause so the operator can review config before tests start.
+printf "  %bPress Enter to start tests%b (Ctrl-C to cancel) " "$DIM" "$NC"
+read -r _
+echo
+echo -e "  ${BOLD}Testing${NC}  ${section_count} section(s) · ${total} host(s)"
+echo -e "  ${DIM}AppCode from masterfile · PASS = SSH login + root switch${NC}"
 echo
 
 #------------------------------------------------------------------------------
@@ -455,7 +471,9 @@ set +e
 
 # Remote check: SSH session must authenticate, then switch to root without a
 # password prompt (-n). Try sudo -i first, then sudo su.
-REMOTE_ROOT_CHECK='if sudo -n -i -- true >/dev/null 2>&1; then echo SUDO_OK sudo_-i; elif sudo -n su -c true >/dev/null 2>&1; then echo SUDO_OK sudo_su; else echo SUDO_FAIL; exit 1; fi'
+# Markers (parsed locally into friendly RESULT text):
+#   SUDO_OK sudo_i | SUDO_OK sudo_su | SUDO_FAIL
+REMOTE_ROOT_CHECK='if sudo -n -i -- true >/dev/null 2>&1; then echo SUDO_OK sudo_i; elif sudo -n su -c true >/dev/null 2>&1; then echo SUDO_OK sudo_su; else echo SUDO_FAIL; exit 1; fi'
 
 i=1
 while [ "$i" -le "$total" ]; do
@@ -477,10 +495,14 @@ while [ "$i" -le "$total" ]; do
   # Print a new section header when the section changes.
   if [ "$section" != "$last_printed_section" ]; then
     echo
-    echo -e "  ${BOLD}${CYAN}Section: ${section}${NC}"
+    echo -e "  ${BOLD}${CYAN}▸ ${section}${NC}"
     print_table_header
     last_printed_section="$section"
   fi
+
+  # Show in-progress line while SSH/sudo runs (cleared when result prints).
+  printf "  ${DIM}%-4s  ....    %-8s  %-20s  %-15s  checking...${NC}" \
+    "$i/$total" "$app_code" "$host_name" "$ip"
 
   # SSH options explained:
   #   -n / </dev/null     do not read stdin (protects callers / tooling)
@@ -514,32 +536,39 @@ while [ "$i" -le "$total" ]; do
   )"
   ssh_rc=$?
 
+  # Clear the in-progress line before printing the final result row.
+  printf "\r\033[K"
+
   if [ "$ssh_rc" -eq 0 ] && printf '%s' "$ssh_output" | grep -q 'SUDO_OK'; then
     # SSH auth + sudo root switch both succeeded.
     sudo_method="$(printf '%s' "$ssh_output" | sed -n 's/.*SUDO_OK //p' | tr -d '\r' | awk 'NF{print $1; exit}')"
     status="PASS"
-    detail="ssh+sudo ok (${sudo_method:-sudo})"
+    case "$sudo_method" in
+      sudo_i)  detail="Login OK · root via sudo -i" ;;
+      sudo_su) detail="Login OK · root via sudo su" ;;
+      *)       detail="Login OK · root switch OK" ;;
+    esac
     pass=$((pass + 1))
     color="$GREEN"
   else
-    # Distinguish SSH failure vs sudo-to-root failure for the detail column.
+    # Distinguish SSH failure vs sudo-to-root failure for the RESULT column.
     status="FAIL"
     if printf '%s' "$ssh_output" | grep -qiE 'Permission denied|Authentication failed|publickey'; then
-      detail="authentication failed"
+      detail="SSH login failed"
     elif printf '%s' "$ssh_output" | grep -q 'SUDO_FAIL' \
       || printf '%s' "$ssh_output" | grep -qiE 'sudo:[[:space:]]|a password is required|is not in the sudoers'; then
-      detail="sudo to root failed"
+      detail="SSH OK · root switch failed"
     else
-      # Collapse multi-line ssh errors into one short detail field.
-      detail="$(printf '%s' "${ssh_output:-connection failed (rc=$ssh_rc)}" | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g' | cut -c1-80)"
+      # Collapse multi-line ssh errors into one short result field.
+      detail="$(printf '%s' "${ssh_output:-Connection failed}" | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g' | cut -c1-60)"
     fi
     fail=$((fail + 1))
     color="$RED"
   fi
 
-  # Result row: STATUS APPCODE HOST IP [n/total] DETAIL
-  printf "  %b%-6s%b  %-8s  %-22s  %-15s  [%s/%s] %s\n" \
-    "$color" "$status" "$NC" "$app_code" "$host_name" "$ip" "$i" "$total" "$detail"
+  # Result row: # STATUS APP HOST IP RESULT
+  printf "  %-4s  %b%-6s%b  %-8s  %-20s  %-15s  %s\n" \
+    "$i/$total" "$color" "$status" "$NC" "$app_code" "$host_name" "$ip" "$detail"
 
   i=$((i + 1))
 done
